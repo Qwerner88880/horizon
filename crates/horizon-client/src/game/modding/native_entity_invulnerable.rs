@@ -63,10 +63,11 @@ impl Game<'_> {
     /// armor, the cooldown and every hurt hook kept, the damage event the
     /// hit already broadcasts — by kind: the player's and mobs' for the
     /// living, the item, dragon and crystal branches for the damageable
-    /// rest. True when the damage was taken. None for a stale handle, false
-    /// for a kind that cannot be hurt and for a damage type the registry
-    /// does not know — an unknown id refuses, it is not silently `generic`
-    /// (#1828, review).
+    /// rest. True when the damage was taken. None for a stale handle (it
+    /// resolves before anything else), false for a kind that cannot be
+    /// hurt, for a damage type the registry does not know — an unknown id
+    /// refuses, it is not silently `generic` — and for an amount that is
+    /// not a number (#1828, review).
     pub(super) fn entity_hurt(
         &mut self,
         entity: EntityRef,
@@ -75,21 +76,29 @@ impl Game<'_> {
         direct: Option<EntityRef>,
         causing: Option<EntityRef>,
     ) -> Option<bool> {
+        // The handle resolves first (#1828, review round 2): a stale one
+        // answers None whatever the damage type or the amount name.
+        let target = self.native_entity_target(entity)?;
+        // An unknown damage type refuses, it is not silently `generic`.
         if self.motion.health.damage.id(damage_type).is_none() {
             return Some(false);
         }
-        let target = self.native_entity_target(entity)?;
+        // A NaN amount refuses the same quiet way: a value that is not a
+        // number never reaches the engine's own paths.
+        if amount.is_nan() {
+            return Some(false);
+        }
+        let direct_ref = direct;
         let direct = direct.and_then(|e| self.native_entity_target(e));
         let causing = causing.and_then(|e| self.native_entity_target(e));
         // `DamageSource(type, cause, at)`: the source position the knockback
         // pushes away from is the direct entity's, and its id rides the
-        // attack the hooks adapter reads as the source's `direct` (#1828).
+        // attack the hooks adapter reads as the source's `direct` (#1828) —
+        // every kind's own id, and a player's or guest's the id their
+        // handle carries.
         let from = direct.and_then(|t| self.target_position(t));
-        let direct_id = direct.and_then(|t| match t {
-            Target::Mob(id) | Target::Stand(id) | Target::Dragon(id) | Target::Item(id) => Some(id),
-            Target::Player | Target::Guest(_) => self.lan_acting_entity,
-            _ => None,
-        });
+        let direct_id =
+            direct.and_then(|t| super::native_entities::target_id(t).or(Some(direct_ref?.id())));
         Some(self.hurt_target(
             target,
             amount,
@@ -486,6 +495,195 @@ mod tests {
             assert_eq!(
                 pig.invulnerable_to_damage(host, "minecraft:fall"),
                 Some(false)
+            );
+        });
+    }
+
+    /// #1828, review round 2: every kind's direct entity — a real arrow, a
+    /// guest — reaches the hooks by its own id, and a NaN amount or a stale
+    /// handle refuses quietly.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn every_direct_kind_and_the_quiet_refusals() {
+        use horizon_client::mobs::Mob;
+        use horizon_client::projectiles::{Projectile, ProjectileKind};
+        use horizon_core::geometry::Vec3;
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Probe(std::sync::Arc<std::sync::Mutex<Vec<(i32, i32, i32)>>>);
+        #[mod_api::__subscriptions]
+        impl mod_api::Hooks for Probe {
+            fn living_incoming_damage(
+                &self,
+                _: &mut dyn mod_api::LevelRandomHost,
+                event: &mut mod_api::LivingIncomingDamageEvent<'_>,
+            ) -> mod_api::Flow {
+                self.0.lock().unwrap().push((
+                    event.entity,
+                    event.source.direct,
+                    event.source.causing,
+                ));
+                mod_api::Flow::Continue
+            }
+        }
+        let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
+            "probe",
+            Box::new(Probe(heard.clone())),
+        )]
+        .into();
+        mod_api::testing::with_mods(mods, || {
+            super::super::native_guest_turn_tests::with_guests(|game| {
+                let kind = |game: &super::Game<'_>, name: &str| {
+                    game.res.mob_types().get(name).unwrap().clone()
+                };
+                game.mobs.push(Mob::new(
+                    300001,
+                    kind(game, "minecraft:pig"),
+                    Vec3::new(0.5, 64.0, 0.5),
+                    0.0,
+                ));
+                // A real arrow in flight, and a skeleton behind it.
+                let mut arrow = Projectile::new(
+                    ProjectileKind::Arrow {
+                        base_damage: 2.0,
+                        critical: false,
+                        effect: None,
+                    },
+                    Vec3::new(1.5, 64.0, 0.5),
+                    None,
+                );
+                // A network id of its own, the way the physics tests take one.
+                arrow.id = game.take_entity_id();
+                let arrow_id = arrow.id;
+                game.creatures.projectiles.push(arrow);
+                game.mobs.push(Mob::new(
+                    300011,
+                    kind(game, "minecraft:skeleton"),
+                    Vec3::new(2.5, 64.0, 0.5),
+                    0.0,
+                ));
+                let pig = game.entity(300001).unwrap();
+                let arrow = game.entity(arrow_id).unwrap();
+                let shooter = game.entity(300011).unwrap();
+                let hurt = {
+                    let host: &mut dyn mod_api::ServerHost = game;
+                    pig.hurt(host, "minecraft:arrow", 5.0, Some(arrow), Some(shooter))
+                };
+                assert_eq!(hurt, Some(true));
+                assert_eq!(
+                    *heard.lock().unwrap(),
+                    vec![(300001_i32, arrow_id as i32, 300011_i32)],
+                    "the hooks see the arrow's own id as the direct entity"
+                );
+
+                // A guest as the direct entity: their handle's own id. The
+                // first hit started the hurt cooldown: out-damage it
+                // (`LivingEntity.hurtServer`'s rule).
+                heard.lock().unwrap().clear();
+                if let Some(m) = game.mobs.iter_mut().find(|m| m.id == 300001) {
+                    m.invulnerable = 0;
+                    m.last_hurt = 0.0;
+                }
+                let guest = game.entity(12).unwrap();
+                let guest_id = guest.id();
+                let hurt = {
+                    let host: &mut dyn mod_api::ServerHost = game;
+                    pig.hurt(host, "minecraft:arrow", 5.0, Some(guest), None)
+                };
+                assert_eq!(hurt, Some(true));
+                assert_eq!(
+                    *heard.lock().unwrap(),
+                    vec![(300001_i32, guest_id as i32, guest_id as i32)],
+                    "the hooks see the guest's own id as the direct entity"
+                );
+
+                // A NaN amount refuses without touching anything; a stale
+                // handle answers None whatever the type names.
+                game.spawn_item(
+                    horizon_client::items::ItemStack::new("minecraft:stone", 1),
+                    [0.5, 64.0, 0.5],
+                    [0.0; 3],
+                    10,
+                );
+                let item_id = game.just_spawned_item().unwrap().id;
+                let item = game.entity(item_id).unwrap();
+                let hurt = {
+                    let host: &mut dyn mod_api::ServerHost = game;
+                    item.hurt(host, "minecraft:generic", f32::NAN, None, None)
+                };
+                assert_eq!(hurt, Some(false));
+                assert!(
+                    game.dropped
+                        .iter()
+                        .any(|e| e.id == item_id && e.stack.count == 1),
+                    "the item is untouched"
+                );
+                let stale = mod_api::EntityRef::new(
+                    mod_api::NativeWorldEpoch::new(pig.epoch().get() + 1),
+                    300001,
+                );
+                let hurt = {
+                    let host: &mut dyn mod_api::ServerHost = game;
+                    stale.hurt(host, "missing:unknown", 5.0, None, None)
+                };
+                assert_eq!(hurt, None, "the stale handle resolves first");
+            });
+        });
+    }
+
+    /// #1828, review round 2: the `Invulnerable` flag holds even a Ghast's
+    /// reflected fireball (`Ghast.hurtServer`); the species' own fire
+    /// immunity is the half that gives way.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn the_flag_holds_a_ghasts_reflected_fireball() {
+        use horizon_client::mobs::Mob;
+        use horizon_core::geometry::Vec3;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let kind = |game: &super::Game<'_>, name: &str| {
+                game.res.mob_types().get(name).unwrap().clone()
+            };
+            // The player whose fireball it is (a reflected one's attacker).
+            game.player =
+                Some(horizon_client::motion::PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.lan_acting_uuid = Some(123);
+            game.lan_acting_entity = Some(20);
+            let player = game.entity(20).unwrap();
+            game.mobs.push(Mob::new(
+                300020,
+                kind(game, "minecraft:ghast"),
+                Vec3::new(4.5, 64.0, 0.5),
+                0.0,
+            ));
+            let ghast = game.entity(300020).unwrap();
+            let hurt = {
+                let host: &mut dyn mod_api::ServerHost = game;
+                ghast.hurt(host, "minecraft:fireball", 5.0, None, Some(player))
+            };
+            assert_eq!(hurt, Some(true));
+            assert!(
+                game.mobs.iter().any(|m| m.id == 300020 && !m.alive()),
+                "the reflected fireball killed it (the 1000 of Ghast.hurtServer)"
+            );
+
+            // With the flag, even the reflected fireball is refused.
+            game.mobs.retain(|m| m.id != 300020);
+            let mut flagged = Mob::new(
+                300021,
+                kind(game, "minecraft:ghast"),
+                Vec3::new(8.5, 64.0, 0.5),
+                0.0,
+            );
+            flagged.invulnerable_flag = true;
+            game.mobs.push(flagged);
+            let flagged = game.entity(300021).unwrap();
+            let hurt = {
+                let host: &mut dyn mod_api::ServerHost = game;
+                flagged.hurt(host, "minecraft:fireball", 5.0, None, Some(player))
+            };
+            assert_eq!(hurt, Some(false));
+            assert!(
+                game.mobs.iter().any(|m| m.id == 300021 && m.health == 10.0),
+                "the flag held the reflected fireball"
             );
         });
     }

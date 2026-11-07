@@ -3853,12 +3853,18 @@ impl Mob {
     /// gate, the Ghast's reflected fireball around it) and
     /// `entity_invulnerable_to_damage` answers.
     pub fn refuses_damage_base(&self, source: &Damage) -> bool {
-        self.refuses_damage(source)
-            || (source.is_fire() && self.kind.flags.fire_immune)
-            || (matches!(source.kind, DamageKind::Named(named)
+        self.refuses_damage(source) || self.species_base_immunity(source)
+    }
+    /// The species' own half of `Entity.isInvulnerableToBase`: the fire an
+    /// immune species never takes and the fall a `#fall_damage_immune`
+    /// species never takes. A Ghast's reflected fireball gives way to
+    /// exactly this half (`Ghast.hurtServer`), never to the flag.
+    fn species_base_immunity(&self, source: &Damage) -> bool {
+        (source.is_fire() && self.kind.flags.fire_immune)
+            || ((matches!(source.kind, DamageKind::Named(named)
                 if named.has(NamedDamage::IS_FALL))
                 || source.kind == DamageKind::Fall)
-                && self.kind.flags.fall_immune
+                && self.kind.flags.fall_immune)
     }
     /// `LivingEntity.hurtServer`'s partial mob adapter, with health reductions inline.
     /// `damage` by a source with a weapon: `armor_effectiveness` runs the
@@ -3902,15 +3908,15 @@ impl Mob {
             // about, so `Player.attack` goes on with its extra knockback and its aftermath.
             return sulfur_cube::immune_to(&source);
         }
-        // Ghast.isReflectedFireball: a fireball a player turned back is
-        // no fire to it, and kills it (Ghast.hurtServer: 1000 damage) — the
-        // one species exception around the base immunities.
+        // Ghast.hurtServer (26.3): `isInvulnerable() && !bypass ||
+        // !reflected && super.isInvulnerableTo(...)` — the flag holds even a
+        // reflected fireball; only the species' own fire and fall
+        // immunities give way to one a player turned back, which then kills
+        // it (the 1000 damage below).
         let reflected = &*self.kind.id == "minecraft:ghast"
             && source.kind == DamageKind::Fireball
             && source.attacker == Some(Who::Player);
-        if self.refuses_damage_base(&source)
-            && !(reflected && source.is_fire() && self.kind.flags.fire_immune)
-        {
+        if self.refuses_damage(&source) || (!reflected && self.species_base_immunity(&source)) {
             return false;
         }
         if !ai::accepts_damage(self, &source, amount, level.attack().player_uuid) {

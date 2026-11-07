@@ -492,8 +492,10 @@ pub trait EntitiesBackendMut {
     /// kept, the damage event the hit already broadcasts is the broadcast —
     /// by kind: the player's and mobs' for the living, the item, vehicle,
     /// dragon and crystal branches for the damageable rest. True when the
-    /// damage was taken. None for a stale handle, false for a kind that
-    /// cannot be hurt. #924.
+    /// damage was taken. None for a stale handle (it resolves before
+    /// anything else), false for a kind that cannot be hurt, for a damage
+    /// type the registry does not know — an unknown id refuses, it is not
+    /// silently `generic` — and for an amount that is not a number. #924.
     #[access(WorldOnly)]
     fn entity_hurt(
         &mut self,
