@@ -198,7 +198,7 @@ impl Game<'_> {
         // Destruction can remove the target before its success message is built.
         let discarded_name = matches!(target, Target::Item(_) | Target::Boat(_) | Target::Cart(_))
             .then(|| self.target_name(target));
-        let hurt = self.hurt_target(target, amount, &ty, by, cause, from);
+        let hurt = self.hurt_target(target, amount, &ty, by, cause, from, None);
         if !hurt {
             return Err(err("commands.damage.invulnerable", &[]));
         }
@@ -227,6 +227,7 @@ impl Game<'_> {
         by: Option<Target>,
         cause: Option<Target>,
         from: Option<[f64; 3]>,
+        direct: Option<u32>,
     ) -> bool {
         match target {
             // The causing mob is the one the hit is credited to and thorns
@@ -259,7 +260,7 @@ impl Game<'_> {
                     if let Some(name) = named {
                         g.note_direct_entity(ty, name);
                     }
-                    let hurt = g.hurt_player_from(amount, from, ty, attacker);
+                    let hurt = g.hurt_player_from_direct(amount, from, ty, attacker, direct);
                     if hurt && let Some(credit) = by_player {
                         g.combat.note_hurt_by_player(credit, now);
                     }
@@ -291,14 +292,14 @@ impl Game<'_> {
                 };
                 if let Some(conn) = guest {
                     let hurt = self
-                        .as_guest(conn, |g| g.command_damage_mob(id, amount, damage))
+                        .as_guest(conn, |g| g.command_damage_mob(id, amount, damage, direct))
                         .unwrap_or(false);
                     if hurt && let Some(host) = self.lan.as_mut() {
                         host.mob_players.insert(id, conn);
                     }
                     hurt
                 } else {
-                    self.command_damage_mob(id, amount, damage)
+                    self.command_damage_mob(id, amount, damage, direct)
                 }
             }
             Target::Item(id) => self.command_damage_item(id, amount, ty, cause.or(by)),
@@ -316,7 +317,9 @@ impl Game<'_> {
                     from.map(|[x, y, z]| horizon_core::geometry::Vec3::new(x, y, z)),
                 ),
             ),
-            Target::Crystal(id) => self.command_damage_crystal(id, ty, Self::damage_kind(ty), cause.or(by)),
+            Target::Crystal(id) => {
+                self.command_damage_crystal(id, ty, Self::damage_kind(ty), cause.or(by))
+            }
             _ => false,
         }
     }
@@ -472,8 +475,23 @@ impl Game<'_> {
     /// `DamageCommand.damage`: retain the accepted hit's player context and run
     /// `Zombie.hurtServer`'s reinforcement requests before the command returns.
     /// Health-changing hits also raise their damage vibration before return.
-    fn command_damage_mob(&mut self, id: u32, amount: f32, damage: Damage) -> bool {
-        let attack = self.attack_of_who(damage.attacker);
+    ///
+    /// `/damage`'s mob branch, with the hit's optional direct entity
+    /// (`DamageSource.getDirectEntity`, #1828 review): the hooks adapter
+    /// reads `Attack.projectile` for it, so a projectile of the damage type
+    /// that names one (`arrow`) reaches the hooks as the source's `direct`.
+    /// None leaves the attack context as it is, as `/damage` always had.
+    fn command_damage_mob(
+        &mut self,
+        id: u32,
+        amount: f32,
+        damage: Damage,
+        direct: Option<u32>,
+    ) -> bool {
+        let mut attack = self.attack_of_who(damage.attacker);
+        if let Some(direct) = direct {
+            attack.projectile = Some(direct as i32);
+        }
         let mut reinforcements = Vec::new();
         let mut health_changed = false;
         let hurt = self.mobs.iter_mut().find(|m| m.id == id).is_some_and(|m| {
@@ -2047,7 +2065,7 @@ mod allay_owner_damage_tests {
                     let accepted = if melee {
                         game.hurt_by_player(0, 2.0, source)
                     } else {
-                        game.command_damage_mob(1, 2.0, source)
+                        game.command_damage_mob(1, 2.0, source, None)
                     };
                     let expected = liked != Some(actual);
                     assert_eq!(accepted, expected, "melee={melee}, liked={liked:?}");

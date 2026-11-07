@@ -4283,6 +4283,26 @@ impl Game<'_> {
     /// `hurtServer` on the player. `from` is the source's position (none: no
     /// direction), `known`: the causing mob when it is given (`/damage`),
     /// else the melee attacker is the mob nearest to `from`.
+    /// `hurt_player_from` with the hit's direct entity
+    /// (`DamageSource.getDirectEntity`, #1828 review): the hooks adapter
+    /// reads `Attack.projectile` for it, exactly as the mob path does.
+    pub(super) fn hurt_player_from_direct(
+        &mut self,
+        amount: f32,
+        from: Option<[f64; 3]>,
+        damage_type: &str,
+        known: Option<Option<u32>>,
+        direct: Option<u32>,
+    ) -> bool {
+        let Some(direct) = direct else {
+            return self.hurt_player_from(amount, from, damage_type, known);
+        };
+        let mut attack = self.current_attack();
+        attack.projectile = Some(direct as i32);
+        self.with_attack(attack, |g| {
+            g.hurt_player_from(amount, from, damage_type, known)
+        })
+    }
     pub(super) fn hurt_player_from(
         &mut self,
         amount: f32,

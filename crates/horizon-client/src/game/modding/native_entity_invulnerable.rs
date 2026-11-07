@@ -64,7 +64,9 @@ impl Game<'_> {
     /// hit already broadcasts — by kind: the player's and mobs' for the
     /// living, the item, dragon and crystal branches for the damageable
     /// rest. True when the damage was taken. None for a stale handle, false
-    /// for a kind that cannot be hurt.
+    /// for a kind that cannot be hurt and for a damage type the registry
+    /// does not know — an unknown id refuses, it is not silently `generic`
+    /// (#1828, review).
     pub(super) fn entity_hurt(
         &mut self,
         entity: EntityRef,
@@ -73,13 +75,30 @@ impl Game<'_> {
         direct: Option<EntityRef>,
         causing: Option<EntityRef>,
     ) -> Option<bool> {
+        if self.motion.health.damage.id(damage_type).is_none() {
+            return Some(false);
+        }
         let target = self.native_entity_target(entity)?;
         let direct = direct.and_then(|e| self.native_entity_target(e));
         let causing = causing.and_then(|e| self.native_entity_target(e));
         // `DamageSource(type, cause, at)`: the source position the knockback
-        // pushes away from is the direct entity's.
+        // pushes away from is the direct entity's, and its id rides the
+        // attack the hooks adapter reads as the source's `direct` (#1828).
         let from = direct.and_then(|t| self.target_position(t));
-        Some(self.hurt_target(target, amount, damage_type, direct, causing, from))
+        let direct_id = direct.and_then(|t| match t {
+            Target::Mob(id) | Target::Stand(id) | Target::Dragon(id) | Target::Item(id) => Some(id),
+            Target::Player | Target::Guest(_) => self.lan_acting_entity,
+            _ => None,
+        });
+        Some(self.hurt_target(
+            target,
+            amount,
+            damage_type,
+            direct,
+            causing,
+            from,
+            direct_id,
+        ))
     }
 
     /// `Entity.isInvulnerableTo` for a source of `damage_type`: #842's own
@@ -98,7 +117,7 @@ impl Game<'_> {
         };
         let m = self.mobs.iter().find(|m| m.id == id)?;
         let source = Damage::of(Self::damage_kind(damage_type));
-        Some(m.refuses_damage(&source))
+        Some(m.refuses_damage_base(&source))
     }
 
     /// Whether `source`'s damage may hit `entity` through their teams
@@ -136,10 +155,7 @@ impl Game<'_> {
     /// `Invulnerable` flag; the temporary window `Entity.invulnerableTime`
     /// opens does not exist yet (#916), so no hit answers through it. None
     /// for a stale handle or a kind without the flag.
-    pub(super) fn entity_invulnerable_to_piercing_weapon(
-        &self,
-        entity: EntityRef,
-    ) -> Option<bool> {
+    pub(super) fn entity_invulnerable_to_piercing_weapon(&self, entity: EntityRef) -> Option<bool> {
         match self.native_entity_target(entity)? {
             Target::Mob(id) => Some(self.mobs.iter().find(|m| m.id == id)?.invulnerable_flag),
             _ => None,
@@ -216,12 +232,7 @@ mod tests {
         .into();
         mod_api::testing::with_mods(mods, || {
             with_game(|game| {
-                let pig = game
-                    .res
-                    .mob_types()
-                    .get("minecraft:pig")
-                    .unwrap()
-                    .clone();
+                let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 game.mobs.push(Mob::new(300001, pig, Vec3::ZERO, 0.0));
                 let victim = game.entity(300001).unwrap();
                 // An accepted hit: taken, the health drops, the damage hooks
@@ -230,7 +241,10 @@ mod tests {
                     victim.hurt(game, "minecraft:generic", 5.0, None, None),
                     Some(true)
                 );
-                assert_eq!(game.mobs[0].health, 5.0, "the pig took it (10 max health, no armor)");
+                assert_eq!(
+                    game.mobs[0].health, 5.0,
+                    "the pig took it (10 max health, no armor)"
+                );
                 // The cooldown: a weaker hit inside the window is refused
                 // (`LivingEntity.hurtServer`'s `damageCooldownTime` rule).
                 assert_eq!(
@@ -265,7 +279,10 @@ mod tests {
                 // A stale handle reads None and hurts nothing.
                 let stale = EntityRef::new(NativeWorldEpoch::new(victim.epoch().get() + 1), 300001);
                 assert_eq!(stale.hurt(game, "minecraft:generic", 5.0, None, None), None);
-                assert_eq!(stale.invulnerable_to_damage(game, "minecraft:generic"), None);
+                assert_eq!(
+                    stale.invulnerable_to_damage(game, "minecraft:generic"),
+                    None
+                );
                 assert_eq!(stale.invulnerable_to_piercing_weapon(game), None);
             });
         });
@@ -286,7 +303,8 @@ mod tests {
                 .get("minecraft:zombie")
                 .unwrap()
                 .clone();
-            game.mobs.push(Mob::new(300001, zombie.clone(), Vec3::ZERO, 0.0));
+            game.mobs
+                .push(Mob::new(300001, zombie.clone(), Vec3::ZERO, 0.0));
             game.mobs.push(Mob::new(300002, zombie, Vec3::ZERO, 0.0));
             let a = game.entity(300001).unwrap();
             let b = game.entity(300002).unwrap();
@@ -325,6 +343,150 @@ mod tests {
             assert_eq!(game.entity_damage_cooldown_time(stale), None);
             assert!(!game.entity_set_damage_cooldown_time(stale, 0));
             assert!(game.mobs[0].invulnerable_flag);
+        });
+    }
+
+    /// #1828, review P1: the direct entity a mod names reaches the hooks'
+    /// `HurtSource.direct`, for a mob victim, alongside the causing one.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn the_direct_entity_reaches_the_damage_hooks() {
+        use horizon_client::mobs::Mob;
+        use horizon_core::geometry::Vec3;
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Probe(std::sync::Arc<std::sync::Mutex<Vec<(i32, i32, i32)>>>);
+        #[mod_api::__subscriptions]
+        impl mod_api::Hooks for Probe {
+            fn living_incoming_damage(
+                &self,
+                _: &mut dyn mod_api::LevelRandomHost,
+                event: &mut mod_api::LivingIncomingDamageEvent<'_>,
+            ) -> mod_api::Flow {
+                self.0.lock().unwrap().push((
+                    event.entity,
+                    event.source.direct,
+                    event.source.causing,
+                ));
+                mod_api::Flow::Continue
+            }
+        }
+        let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
+            "probe",
+            Box::new(Probe(heard.clone())),
+        )]
+        .into();
+        mod_api::testing::with_mods(mods, || {
+            super::super::native_entity_refs::tests::with_game(|game| {
+                let kind = |game: &super::Game<'_>, name: &str| {
+                    game.res.mob_types().get(name).unwrap().clone()
+                };
+                game.mobs.push(Mob::new(
+                    300001,
+                    kind(game, "minecraft:pig"),
+                    Vec3::new(0.5, 64.0, 0.5),
+                    0.0,
+                ));
+                // A: the arrow in flight. B: the shooter it belongs to.
+                game.mobs.push(Mob::new(
+                    300010,
+                    kind(game, "minecraft:skeleton"),
+                    Vec3::new(1.5, 64.0, 0.5),
+                    0.0,
+                ));
+                game.mobs.push(Mob::new(
+                    300011,
+                    kind(game, "minecraft:skeleton"),
+                    Vec3::new(2.5, 64.0, 0.5),
+                    0.0,
+                ));
+                let victim = game.entity(300001).unwrap();
+                let arrow = game.entity(300010).unwrap();
+                let shooter = game.entity(300011).unwrap();
+                let hurt = {
+                    let host: &mut dyn mod_api::ServerHost = game;
+                    victim.hurt(host, "minecraft:arrow", 5.0, Some(arrow), Some(shooter))
+                };
+                assert_eq!(hurt, Some(true));
+                let heard = heard.lock().unwrap();
+                assert_eq!(
+                    *heard,
+                    vec![(300001_i32, 300010_i32, 300011_i32)],
+                    "the hooks see the arrow as the direct entity, its owner as the causing one"
+                );
+            });
+        });
+    }
+
+    /// #1828, review P2: an unknown damage type refuses, nothing is touched,
+    /// and the whole base immunity answers — fire, fall and the flag.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn unknown_types_refuse_and_the_whole_base_immunity_answers() {
+        use horizon_client::mobs::Mob;
+        use horizon_core::geometry::Vec3;
+        use mod_api::Host;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let kind = |game: &super::Game<'_>, name: &str| {
+                game.res.mob_types().get(name).unwrap().clone()
+            };
+            game.mobs.push(Mob::new(
+                300001,
+                kind(game, "minecraft:pig"),
+                Vec3::new(0.5, 64.0, 0.5),
+                0.0,
+            ));
+            game.mobs.push(Mob::new(
+                300002,
+                kind(game, "minecraft:blaze"),
+                Vec3::new(4.5, 64.0, 0.5),
+                0.0,
+            ));
+            game.mobs.push(Mob::new(
+                300003,
+                kind(game, "minecraft:chicken"),
+                Vec3::new(8.5, 64.0, 0.5),
+                0.0,
+            ));
+            game.mobs.push(Mob::new(
+                300004,
+                kind(game, "minecraft:zombie"),
+                Vec3::new(12.5, 64.0, 0.5),
+                0.0,
+            ));
+            let pig = game.entity(300001).unwrap();
+            {
+                let host: &mut dyn mod_api::ServerHost = game;
+                // An unknown damage type refuses and never touches the entity.
+                assert_eq!(
+                    pig.hurt(host, "missing:unknown", 5.0, None, None),
+                    Some(false)
+                );
+            }
+            assert_eq!(game.mobs[0].health, 10.0, "the pig was not hurt");
+
+            // Fire a fire-immune species never takes
+            // (`Entity.isInvulnerableToBase`); a zombie takes it.
+            let blaze = game.entity(300002).unwrap();
+            let chicken = game.entity(300003).unwrap();
+            let zombie = game.entity(300004).unwrap();
+            let host: &dyn Host = game;
+            assert_eq!(
+                blaze.invulnerable_to_damage(host, "minecraft:in_fire"),
+                Some(true)
+            );
+            assert_eq!(
+                zombie.invulnerable_to_damage(host, "minecraft:in_fire"),
+                Some(false)
+            );
+            // A fall a `#fall_damage_immune` species never takes.
+            assert_eq!(
+                chicken.invulnerable_to_damage(host, "minecraft:fall"),
+                Some(true)
+            );
+            assert_eq!(
+                pig.invulnerable_to_damage(host, "minecraft:fall"),
+                Some(false)
+            );
         });
     }
 }

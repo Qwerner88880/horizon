@@ -3844,6 +3844,22 @@ impl Mob {
             || self.removed
             || (self.invulnerable_flag && !source.kind.bypasses_invulnerability())
     }
+    /// `Entity.isInvulnerableToBase` whole (#1828, review):
+    /// [`refuses_damage`](Self::refuses_damage) — dead, removed or the
+    /// `Invulnerable` flag only `#bypasses_invulnerability` gets past —
+    /// plus the fire an immune species never takes and the fall a
+    /// `#fall_damage_immune` species never takes. The one decision the
+    /// damage path guards with (right after the species' own sulfur-cube
+    /// gate, the Ghast's reflected fireball around it) and
+    /// `entity_invulnerable_to_damage` answers.
+    pub fn refuses_damage_base(&self, source: &Damage) -> bool {
+        self.refuses_damage(source)
+            || (source.is_fire() && self.kind.flags.fire_immune)
+            || (matches!(source.kind, DamageKind::Named(named)
+                if named.has(NamedDamage::IS_FALL))
+                || source.kind == DamageKind::Fall)
+                && self.kind.flags.fall_immune
+    }
     /// `LivingEntity.hurtServer`'s partial mob adapter, with health reductions inline.
     /// `damage` by a source with a weapon: `armor_effectiveness` runs the
     /// weapon's armor-effectiveness enchantments (breach) over the armor fraction, with the
@@ -3886,15 +3902,15 @@ impl Mob {
             // about, so `Player.attack` goes on with its extra knockback and its aftermath.
             return sulfur_cube::immune_to(&source);
         }
-        if self.refuses_damage(&source) {
-            return false;
-        }
         // Ghast.isReflectedFireball: a fireball a player turned back is
-        // no fire to it, and kills it (Ghast.hurtServer: 1000 damage).
+        // no fire to it, and kills it (Ghast.hurtServer: 1000 damage) — the
+        // one species exception around the base immunities.
         let reflected = &*self.kind.id == "minecraft:ghast"
             && source.kind == DamageKind::Fireball
             && source.attacker == Some(Who::Player);
-        if source.is_fire() && (self.kind.flags.fire_immune) && !reflected {
+        if self.refuses_damage_base(&source)
+            && !(reflected && source.is_fire() && self.kind.flags.fire_immune)
+        {
             return false;
         }
         if !ai::accepts_damage(self, &source, amount, level.attack().player_uuid) {

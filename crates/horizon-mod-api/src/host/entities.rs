@@ -155,12 +155,13 @@ pub trait EntitiesBackend {
     #[access(WorldOnly)]
     fn entity_damage_cooldown_time(&self, entity: EntityRef) -> Option<i32>;
     /// Side: server.
-    /// `Entity.isInvulnerableTo` for a source of `damage_type`: #842's own
-    /// decision, the guard every mob damage hook runs after — dead or
-    /// removed, or the `Invulnerable` flag nothing but
-    /// `#bypasses_invulnerability` gets past. None for a stale handle or a
-    /// kind with no such decision (the player's paths answer their refusals
-    /// at hurt time). #924.
+    /// `Entity.isInvulnerableToBase` for a source of `damage_type`: the one
+    /// decision the mob damage path guards with (#1828) — dead or removed,
+    /// the `Invulnerable` flag nothing but `#bypasses_invulnerability` gets
+    /// past, fire a fire-immune species never takes, a fall a
+    /// `#fall_damage_immune` species never takes. None for a stale handle or
+    /// a kind with no such decision (the player's paths answer their
+    /// refusals at hurt time). #924.
     #[access(WorldOnly)]
     fn entity_invulnerable_to_damage(&self, entity: EntityRef, damage_type: &str) -> Option<bool>;
     /// Side: server.
